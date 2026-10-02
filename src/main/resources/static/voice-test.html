@@ -84,8 +84,7 @@
     const CHUNK_MS = 100;
     const MIN_RECORD_MS = 800;
     const SILENCE_TAIL_MS = 800;
-    const HARD_CLOSE_MS = 20000;            // 流式拉长，避免长文本被切
-    const STREAM_SILENCE_MS = 3500;         // 流式：连续 N 毫秒无新帧 → 关 WS
+    const HARD_CLOSE_MS = 60000;            // 仅作故障兜底，正常完成由后端 done 通知
 
     // ========== 状态机 ==========
     const State = Object.freeze({
@@ -108,7 +107,8 @@
     let recordStartAt = 0, playbackTime = 0;
     let userStopped = false;
     let hardCloseTimer = null;
-    let streamSilenceTimer = null;          // 流式静默计时器
+    let responseCloseTimer = null;
+    let responseFinished = false;
 
     // ========== 状态切换 ==========
     function setState(next) {
@@ -183,7 +183,7 @@ registerProcessor('pcm-collector', PcmCollector);
     // ========== 资源清理 ==========
     async function cleanup() {
         if (hardCloseTimer)     { clearTimeout(hardCloseTimer);     hardCloseTimer = null; }
-        if (streamSilenceTimer) { clearTimeout(streamSilenceTimer); streamSilenceTimer = null; }
+        if (responseCloseTimer) { clearTimeout(responseCloseTimer); responseCloseTimer = null; }
         if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
         if (micStream)   { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
         if (audioCtx)    { try { await audioCtx.close(); } catch (_) {} audioCtx = null; }
@@ -199,6 +199,7 @@ registerProcessor('pcm-collector', PcmCollector);
         try {
             await cleanup();
             userStopped = false;
+            responseFinished = false;
             playbackTime = 0;
             $caption.textContent = '';
             $products.innerHTML = '';
@@ -264,7 +265,12 @@ registerProcessor('pcm-collector', PcmCollector);
         $meter.style.width = '0%';
 
         if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(new Int16Array(TARGET_RATE * SILENCE_TAIL_MS / 1000).buffer);
+            // 与正常录音一样按 CHUNK_MS 分包，避免超过服务器的单条消息上限。
+            const silence = new Int16Array(TARGET_RATE * SILENCE_TAIL_MS / 1000);
+            const samplesPerChunk = TARGET_RATE * CHUNK_MS / 1000;
+            for (let offset = 0; offset < silence.length; offset += samplesPerChunk) {
+                ws.send(silence.slice(offset, offset + samplesPerChunk).buffer);
+            }
         }
 
         userStopped = true;
@@ -274,11 +280,12 @@ registerProcessor('pcm-collector', PcmCollector);
         // 兜底：WAITING 最多等 HARD_CLOSE_MS
         const session = ws;
         hardCloseTimer = setTimeout(() => {
-            if (session && session.readyState === WebSocket.OPEN) {
-                log('兜底超时，主动关闭 WebSocket', 'warn');
+            if (session === ws && session && session.readyState === WebSocket.OPEN) {
+                log('等待回复超时，请重试', 'err');
                 session.close();
             }
         }, HARD_CLOSE_MS);
+        if (responseFinished) finishResponse(session);
     }
 
     // ========== 处理后端消息 ==========
@@ -290,8 +297,7 @@ registerProcessor('pcm-collector', PcmCollector);
                 case 'asr':
                     log(`ASR ${msg.final ? '[最终]' : '[实时]'} ${msg.text || '(空)'}`,
                         msg.final ? 'asr-final' : 'asr-partial');
-                    // 流式版：final 时清空上一次的 caption / products；
-                    //        关闭时机交给 bumpStreamSilence（不再用 final 倒计时）
+                    // 最终识别结果之后由后端明确通知完成或失败。
                     if (msg.final && userStopped) {
                         $caption.textContent = '';
                         $products.innerHTML = '';
@@ -299,18 +305,28 @@ registerProcessor('pcm-collector', PcmCollector);
                     break;
                 case 'caption':
                     appendCaption(msg.text);
-                    bumpStreamSilence(session);
                     break;
                 case 'recommendation':
                     renderProducts(msg.items);
-                    bumpStreamSilence(session);
+                    break;
+                case 'done':
+                    responseFinished = true;
+                    log('Agent 回复完成');
+                    finishResponse(session);
+                    break;
+                case 'error':
+                    log(msg.message || '处理失败，请重试', 'err');
+                    if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
+                    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+                    userStopped = true;
+                    responseFinished = true;
+                    finishResponse(session);
                     break;
                 default:
                     log(`未知文本帧 type=${msg.type}`, 'warn');
             }
         } else {
             playPcm(e.data);
-            bumpStreamSilence(session);
         }
     }
 
@@ -335,17 +351,16 @@ registerProcessor('pcm-collector', PcmCollector);
         });
     }
 
-    // ========== 流式静默判断：连续 STREAM_SILENCE_MS 没收到任何流帧就关 WS ==========
-    function bumpStreamSilence(session) {
-        if (streamSilenceTimer) clearTimeout(streamSilenceTimer);
-        streamSilenceTimer = setTimeout(() => {
-            if (session === ws && ws && ws.readyState === WebSocket.OPEN
-                && (state === State.WAITING || state === State.RECORDING)) {
-                log(`流式静默 ${STREAM_SILENCE_MS}ms，关闭 WebSocket`);
-                setState(State.CLOSING);
-                try { session.close(); } catch (_) {}
-            }
-        }, STREAM_SILENCE_MS);
+    // ========== 后端完成后，等已排队的语音播放完再关闭连接 ==========
+    function finishResponse(session) {
+        if (session !== ws || !userStopped || !responseFinished) return;
+        if (hardCloseTimer) { clearTimeout(hardCloseTimer); hardCloseTimer = null; }
+        if (responseCloseTimer) clearTimeout(responseCloseTimer);
+        setState(State.CLOSING);
+        const remainingMs = audioCtx ? Math.max(0, playbackTime - audioCtx.currentTime) * 1000 : 0;
+        responseCloseTimer = setTimeout(() => {
+            if (session === ws && session.readyState === WebSocket.OPEN) session.close();
+        }, remainingMs);
     }
 
     // ========== 播放 TTS PCM 帧（playbackTime 调度，自动顺序拼接） ==========
