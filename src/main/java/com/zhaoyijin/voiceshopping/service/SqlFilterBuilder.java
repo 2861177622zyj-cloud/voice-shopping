@@ -13,8 +13,21 @@ public class SqlFilterBuilder {
 
         Object category = slots.get("category");
         if (category != null) {
-            frags.add("category_l2 = ?");
-            params.add(category.toString());
+            // 宽泛的鞋类名称匹配子类；具体品类仍精确过滤，预算继续作为独立条件。
+            switch (category.toString()) {
+                case "运动鞋" -> {
+                    frags.add("(category_l2 = ? OR (category_l1 = ? AND category_l2 LIKE ?))");
+                    params.addAll(List.of("运动鞋", "运动", "%鞋"));
+                }
+                case "鞋", "鞋子" -> {
+                    frags.add("category_l2 LIKE ?");
+                    params.add("%鞋");
+                }
+                default -> {
+                    frags.add("category_l2 = ?");
+                    params.add(category.toString());
+                }
+            }
         }
 
         Object budget = slots.get("budget");
