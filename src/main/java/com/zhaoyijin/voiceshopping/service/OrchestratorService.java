@@ -177,8 +177,24 @@ public class OrchestratorService {
         // "便宜点/贵点"要以**上一轮推荐的实际价格**为锚，不能直接用 budget——
         // budget 只是用户给的上限，上一轮推出来的商品可能远低于 budget，
         // 若直接按 budget * 0.8 下调，新上限可能还比上一轮最高价高，起不到"便宜"的效果。
-        String pd = (String) slots.get("priceDirection");
+        String pd = intent.slots() == null ? null : (String) intent.slots().get("priceDirection");
         List<Long> lastIds = state.getLastRecommendations();
+        // 介绍/对比上一轮商品时保留原商品及顺序，不重新检索出另一批。
+        if (pd == null && lastIds != null && !lastIds.isEmpty()
+                && (utterance.contains("介绍") || utterance.contains("对比")
+                || utterance.contains("比较") || utterance.contains("这三款")
+                || utterance.contains("这几款") || utterance.contains("哪个好"))) {
+            Map<Long, ProductEntity> previous = productRepo.findByIdIn(lastIds).stream()
+                    .collect(Collectors.toMap(ProductEntity::getId, p -> p));
+            List<RecommendedItem> items = lastIds.stream().map(previous::get)
+                    .filter(Objects::nonNull)
+                    .map(p -> new RecommendedItem(p.getId(), p.getName(), p.getPrice(),
+                            p.getDescription(), 1.0,
+                            p.getAttributes() == null ? Map.of() : p.getAttributes()))
+                    .toList();
+            return emotionService.wrap(sessionId, utterance, formatUserNeeds(slots),
+                    new RecommendResult(items, "professional"));
+        }
         if (pd != null && lastIds != null && !lastIds.isEmpty()) {
             List<BigDecimal> lastPrices = productRepo.findByIdIn(lastIds).stream()
                     .map(ProductEntity::getPrice).toList();
@@ -198,6 +214,9 @@ public class OrchestratorService {
         }
 
         RecommendResult rec = recommendService.recommend(sessionId, userId, utterance, slots);
+        state.setSlots(slots);
+        state.setPhase("RECOMMEND");
+        state.setLastRecommendations(rec.items().stream().map(RecommendedItem::productId).toList());
         String userNeeds = formatUserNeeds(slots);
         return emotionService.wrap(sessionId, utterance, userNeeds, rec);
     }
@@ -316,20 +335,36 @@ public class OrchestratorService {
     }
 
     public Flux<StreamChunk> streamHandle(String sessionId, Long userId, String utterance) {
-        IntentResult intent = intentService.classify(sessionId, utterance);
+        sessionService.openIfAbsent(sessionId, userId, "HOME_ENTRY");
+        SessionStateEntity state = stateService.load(sessionId);
+        IntentResult intent = reviseIntentByContext(state, intentService.classify(sessionId, utterance));
         log.info("[Stream] sessionId={} intent={} slots={}",
                 sessionId, intent.intent(), intent.slots());
 
-        if (intent.intent() != Intent.PRODUCT_RECOMMENDATION) {
+        if (intent.intent() != Intent.PRODUCT_RECOMMENDATION || "ORDER_CONFIRM".equals(state.getPhase())) {
             EmotionResult r = handle(sessionId, userId, utterance);
+            Flux<StreamChunk> products = r.displayBlocks() == null || r.displayBlocks().isEmpty()
+                    ? Flux.empty() : Flux.just(StreamChunk.products(r.displayBlocks()));
             return Flux.concat(
+                    products,
                     Flux.just(StreamChunk.text(r.speechText())),
                     ttsAudio(r.speechText()).map(StreamChunk::audio)
             );
         }
 
-        Map<String, Object> slots = intent.slots() == null ? Map.of() : intent.slots();
+        Map<String, Object> slots = new HashMap<>();
+        if (state.getSlots() != null) slots.putAll(state.getSlots());
+        if (intent.slots() != null) intent.slots().forEach((k, v) -> {
+            if (v != null) slots.put(k, v);
+        });
+        eventPublisher.publishUserSpoken(sessionId, userId, utterance);
         RecommendResult rec = recommendService.recommend(sessionId, userId, utterance, slots);
+        state.setSlots(slots);
+        state.setCurrentIntent("PRODUCT_RECOMMENDATION");
+        state.setPhase("RECOMMEND");
+        state.setPendingAsk(null);
+        state.setLastRecommendations(rec.items().stream().map(RecommendedItem::productId).toList());
+        stateService.save(state);
         log.info("[Stream-Rec] sessionId={} slotsForRecommend={} recCount={}",
                 sessionId, slots, rec.items().size());
 
@@ -338,14 +373,19 @@ public class OrchestratorService {
 
         // EmotionAgent 流式文本 → 句子聚合 → TTS 流式合成
         Flux<String> rawTokens = emotionStreamingService.streamWrap(sessionId, utterance, rec);
-        Flux<String> sentences = SentenceAggregator.aggregate(rawTokens);
+        StringBuilder reply = new StringBuilder();
+        Flux<String> sentences = SentenceAggregator.aggregate(rawTokens).doOnNext(reply::append);
 
         Flux<StreamChunk> textFlow = sentences.concatMap(sentence -> Flux.merge(
                 Flux.just(StreamChunk.text(sentence)),
                 ttsAudio(sentence).map(StreamChunk::audio)
         ));
 
-        return Flux.concat(productsFlow, textFlow);
+        return Flux.concat(productsFlow, textFlow).doOnComplete(() -> {
+            String summary = turnSummarizer.summarize(utterance, Intent.PRODUCT_RECOMMENDATION, reply.toString());
+            memory.append(sessionId, new ShortTermMemory.Turn(
+                    "TURN", Intent.PRODUCT_RECOMMENDATION.name(), summary, System.currentTimeMillis()));
+        });
     }
 
 
