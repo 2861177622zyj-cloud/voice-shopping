@@ -1,5 +1,7 @@
 package com.zhaoyijin.voiceshopping.dto;
 
+import java.io.Serial;
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
@@ -18,7 +20,10 @@ public record UserProfileSnapshot(
         List<Long> recentPurchased,
         BigDecimal priceSensitivity,
         BigDecimal avgOrderAmount
-) {
+) implements Serializable {
+    @Serial
+    private static final long serialVersionUID = 1L;
+
     /**
      * 生成一段适合塞进 Prompt 的自然语言
      */
