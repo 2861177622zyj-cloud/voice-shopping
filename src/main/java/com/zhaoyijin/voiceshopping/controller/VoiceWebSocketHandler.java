@@ -118,9 +118,22 @@ public class VoiceWebSocketHandler extends AbstractWebSocketHandler {
                 } catch (IOException e) {
                     log.warn("WebSocket 发送失败（session 可能已关闭）: {}", e.getMessage());
                 }
-            }, err -> log.error("流式失败 sessionId={}", sessionId, err));
+            }, err -> {
+                log.error("流式失败 sessionId={}", sessionId, err);
+                sendStatus(session, "error", "处理失败，请稍后重试。");
+            }, () -> sendStatus(session, "done", ""));
         } catch (Exception e) {
             log.error("流式处理错误 sessionId={}", sessionId, e);
+            sendStatus(session, "error", "处理失败，请稍后重试。");
+        }
+    }
+
+    private void sendStatus(WebSocketSession session, String type, String message) {
+        if (!session.isOpen()) return;
+        try {
+            sendJson(session, Map.of("type", type, "message", message));
+        } catch (IOException e) {
+            log.warn("状态回包失败 sessionId={}: {}", session.getId(), e.getMessage());
         }
     }
 
