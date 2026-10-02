@@ -12,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.util.Optional;
+import java.util.HashMap;
 
 @Service
 @RequiredArgsConstructor
@@ -29,27 +30,33 @@ public class SessionStateService {
     @SneakyThrows
     public SessionStateEntity load(String sessionId) {
         String cached = redis.opsForValue().get(key(sessionId));
-        if (cached != null) return mapper.readValue(cached, SessionStateEntity.class);
+        if (cached != null) return ensureSlots(mapper.readValue(cached, SessionStateEntity.class));
         Optional<SessionStateEntity> fromDb = repo.findById(sessionId);
         if (fromDb.isPresent()) {
-            syncToRedis(fromDb.get());
-            return fromDb.get();
+            SessionStateEntity state = ensureSlots(fromDb.get());
+            syncToRedis(state);
+            return state;
         }
         SessionStateEntity init = new SessionStateEntity();
         init.setSessionId(sessionId);
         init.setPhase("INTENT");
-        return init;
+        return ensureSlots(init);
     }
 
     @Transactional
     @SneakyThrows
     public void save(SessionStateEntity state) {
-        repo.save(state);
+        repo.save(ensureSlots(state));
         try {
             syncToRedis(state);       // 缓存：Redis 后写，挂了吞掉
         } catch (org.springframework.data.redis.RedisConnectionFailureException e) {
             log.warn("Redis 同步失败，下次 load 会从 PG 重建 sessionId={}", state.getSessionId(), e);
         }
+    }
+
+    private SessionStateEntity ensureSlots(SessionStateEntity state) {
+        if (state.getSlots() == null) state.setSlots(new HashMap<>());
+        return state;
     }
 
     @SneakyThrows
